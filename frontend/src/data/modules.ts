@@ -78,6 +78,7 @@ export const MODULES: ModuleMeta[] = [
     actions: ["启效规则", "标记失败", "停用规则"],
     actionTargets: {"启效规则": "生效中", "标记失败": "清洗失败", "停用规则": "已停用"},
     metrics: ["规则总数", "生效中规则", "清洗失败规则"],
+    extraLinks: [{ label: "输入复核", to: "/field_clean/review" }],
   },
   {
     key: "batch_store",
@@ -89,6 +90,7 @@ export const MODULES: ModuleMeta[] = [
     actions: ["触发校验", "标记通过", "标记失败"],
     actionTargets: {"触发校验": "已落盘", "标记通过": "校验通过", "标记失败": "校验失败"},
     metrics: ["批次总数", "校验通过批次", "校验失败批次"],
+    detailPath: (row) => `/batch_store/${encodeURIComponent(String(row["批次编号"] ?? row.id))}/detail`,
   },
   {
     key: "incr_crawl",

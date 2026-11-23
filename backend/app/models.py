@@ -16,6 +16,109 @@ from urllib.parse import urlparse
 
 
 # ---------------------------------------------------------------------------
+# 值语义辅助：区分「合法值」与「真实空项」
+# ---------------------------------------------------------------------------
+
+def is_missing(value: Any) -> bool:
+    """判断一个字段值是否真实缺失。
+
+    数字 0、布尔 False 都是合法值，不能被当成缺失；只有 None、空白字符串
+    以及空容器才属于真实空项。旧实现用 ``not value`` 判断，会把 0/False
+    误判为缺失，这里统一收敛语义。
+    """
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def type_name(value: Any) -> str:
+    """字段值的类型标签，供摘要与回执区分 0 / "0" / False。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, str):
+        return "str"
+    if isinstance(value, (list, tuple)):
+        return "list"
+    if isinstance(value, dict):
+        return "dict"
+    return type(value).__name__
+
+
+def _field_digest_payload(fields: dict[str, Any]) -> dict[str, Any]:
+    """字段摘要载荷：带类型标签，保证 0 / False / "0" 不会摘要碰撞。"""
+    return {
+        key: {"type": type_name(value), "value": value}
+        for key, value in sorted(fields.items())
+    }
+
+
+def content_digest(
+    source_url: str,
+    extract_rule_id: str,
+    fields: dict[str, Any],
+    valid: bool,
+    missing_fields: list[str] | None = None,
+) -> str:
+    """单行清洗结果的独立摘要（不含批次上下文，可脱离批次复核）。"""
+    payload = {
+        "source_url": source_url,
+        "extract_rule_id": extract_rule_id,
+        "fields": _field_digest_payload(fields),
+        "valid": bool(valid),
+        "missing_fields": sorted(missing_fields or []),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    ).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def manifest_digest(rows: list[dict[str, Any]]) -> str:
+    """批次摘要（v2）：按行序覆盖来源、抽取规则、字段类型/值与缺失判定。
+
+    任何一行、任一字段（含 0/False）或有效性判定变化都会改变摘要；摘要是
+    自包含的，属于可独立校验格式。
+    """
+    payload = []
+    for row in rows:
+        payload.append({
+            "source_url": row.get("source_url", ""),
+            "extract_rule_id": row.get("extract_rule_id", ""),
+            "fields": _field_digest_payload(row.get("fields", {})),
+            "valid": bool(row.get("valid", True)),
+            "missing_fields": sorted(row.get("missing_fields", [])),
+        })
+    encoded = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    ).encode()
+    return "v2:" + hashlib.sha256(encoded).hexdigest()
+
+
+def legacy_fields_digest(rows: list[dict[str, Any]]) -> str:
+    """历史批次摘要算法（保留用于兼容已确认摘要）。
+
+    旧实现：``sha256(json.dumps([r.fields ...], sort_keys=True))``，落库时只
+    截取前 16 位。这里原样保留，读取历史批次时可继续核对。
+    """
+    payload = json.dumps(
+        [row.get("fields", {}) for row in rows], sort_keys=True, default=str
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # 枚举
 # ---------------------------------------------------------------------------
 
@@ -280,19 +383,47 @@ class CleanRule:
 
 @dataclass
 class CleanedContent:
-    """清洗后内容：field_clean 输出，batch_store 输入。"""
+    """清洗后内容：field_clean 输出，batch_store 输入。
+
+    字段值保留原始类型（0 是 int、False 是 bool），原始抽取输入与抽取规则
+    一并携带，真实空项通过 missing_fields 明确列出，供存储侧逐行核查。
+    """
     source_url: str
     extract_rule_id: str
     fields: dict[str, Any] = field(default_factory=dict)
+    raw_fields: dict[str, Any] = field(default_factory=dict)
     clean_errors: list[str] = field(default_factory=list)
+    missing_fields: list[str] = field(default_factory=list)
+    field_sources: dict[str, str] = field(default_factory=dict)
     cleaned_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+    def compute_missing_fields(self) -> list[str]:
+        """返回真实空项字段；0 与 False 不算缺失。"""
+        return [name for name, value in self.fields.items() if is_missing(value)]
+
+    def invalid_reasons(self) -> list[str]:
+        reasons = list(self.clean_errors)
+        missing = self.missing_fields or self.compute_missing_fields()
+        reasons.extend(f"字段 {name} 缺失" for name in missing)
+        if not self.fields:
+            reasons.append("整行无字段")
+        return reasons
+
     def is_valid(self) -> bool:
-        if len(self.clean_errors) > 0:
+        if self.clean_errors:
             return False
-        if len(self.fields) == 0:
+        if not self.fields:
             return False
-        return all(v for v in self.fields.values())
+        return not (self.missing_fields or self.compute_missing_fields())
+
+    def row_digest(self) -> str:
+        return content_digest(
+            self.source_url,
+            self.extract_rule_id,
+            self.fields,
+            self.is_valid(),
+            self.missing_fields or self.compute_missing_fields(),
+        )
 
 
 @dataclass
@@ -311,10 +442,15 @@ class StorageBatch:
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> StorageBatch:
+        raw_count = row.get("数据行数", 0)
+        try:
+            row_count = int(raw_count)
+        except (TypeError, ValueError):
+            row_count = 0
         return cls(
             batch_id=str(row.get("批次编号", "")),
             source_job_id=str(row.get("来源作业", "")),
-            row_count=int(row.get("数据行数", 0)),
+            row_count=row_count,
             storage_path=str(row.get("存储路径", "")),
             compression=str(row.get("压缩格式", "gzip")),
             schema_version=str(row.get("Schema版本", "v1")),
@@ -323,9 +459,190 @@ class StorageBatch:
             status=str(row.get("status", "采集中")),
         )
 
+    def storage_manifest(self) -> list[dict[str, Any]]:
+        """批次存储清单：每行的字段值、类型、有效性与失败原因，可独立复核。"""
+        manifest: list[dict[str, Any]] = []
+        for index, record in enumerate(self.records):
+            missing = record.missing_fields or record.compute_missing_fields()
+            manifest.append({
+                "row_index": index + 1,
+                "source_url": record.source_url,
+                "extract_rule_id": record.extract_rule_id,
+                "fields": dict(record.fields),
+                "raw_fields": dict(record.raw_fields),
+                "field_sources": dict(record.field_sources),
+                "valid": record.is_valid(),
+                "missing_fields": missing,
+                "reasons": record.invalid_reasons(),
+                "digest": record.row_digest(),
+            })
+        return manifest
+
     def compute_checksum(self) -> str:
-        payload = json.dumps([r.fields for r in self.records], sort_keys=True, default=str)
-        return hashlib.sha256(payload.encode()).hexdigest()
+        """批次摘要（v2）：带类型标签，0/False 与真实空项判定都能被独立校验。"""
+        return manifest_digest([
+            {
+                "source_url": record.source_url,
+                "extract_rule_id": record.extract_rule_id,
+                "fields": record.fields,
+                "valid": record.is_valid(),
+                "missing_fields": record.missing_fields or record.compute_missing_fields(),
+            }
+            for record in self.records
+        ])
+
+    def compute_legacy_checksum(self) -> str:
+        """历史摘要算法：用于核对旧批次已确认的校验摘要（16 位十六进制）。"""
+        return legacy_fields_digest([{"fields": record.fields} for record in self.records])
+
+
+@dataclass
+class FieldReceipt:
+    """字段校验回执：单个字段的保存值、类型、有效性与来源。"""
+    field: str
+    value: Any
+    value_type: str
+    status: str
+    source: str
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "field": self.field,
+            "value": self.value,
+            "value_type": self.value_type,
+            "status": self.status,
+            "source": self.source,
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class RowReceipt:
+    """行校验回执：一行清洗结果的有效性和失败原因。"""
+    row_index: int
+    source_url: str
+    extract_rule_id: str
+    valid: bool
+    fields: dict[str, Any]
+    raw_fields: dict[str, Any]
+    missing_fields: list[str]
+    reasons: list[str]
+    field_receipts: list[FieldReceipt]
+    digest: str
+    field_sources: dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "row_index": self.row_index,
+            "source_url": self.source_url,
+            "extract_rule_id": self.extract_rule_id,
+            "valid": self.valid,
+            "fields": {name: {"value": value, "value_type": type_name(value)}
+                       for name, value in self.fields.items()},
+            "raw_fields": dict(self.raw_fields),
+            "field_sources": dict(self.field_sources),
+            "missing_fields": list(self.missing_fields),
+            "reasons": list(self.reasons),
+            "field_receipts": [item.to_dict() for item in self.field_receipts],
+            "digest": self.digest,
+        }
+
+
+@dataclass
+class ValidationReceipt:
+    """批次校验回执：一个可入库的版本，携带判断范围与可独立校验的摘要。"""
+    receipt_id: str
+    batch_id: str
+    version: int
+    kind: str
+    status: str
+    valid: bool
+    checksum: str
+    legacy_checksum: str
+    stored_legacy_checksum: str
+    judgement_scope: list[str]
+    rows: list[RowReceipt]
+    source_revision: str = ""
+    idempotency_key: str = ""
+    base_version: int = 0
+    corrected_fields: list[str] = field(default_factory=list)
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    confirmed_at: str = ""
+    confirmed_by: str = ""
+    superseded_by: int | None = None
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "batch_id": self.batch_id,
+            "version": self.version,
+            "kind": self.kind,
+            "status": self.status,
+            "valid": self.valid,
+            "checksum": self.checksum,
+            "legacy_checksum": self.legacy_checksum,
+            "stored_legacy_checksum": self.stored_legacy_checksum,
+            "legacy_checksum_matches": _legacy_matches(
+                self.stored_legacy_checksum, self.legacy_checksum),
+            "judgement_scope": list(self.judgement_scope),
+            "source_revision": self.source_revision,
+            "idempotency_key": self.idempotency_key,
+            "base_version": self.base_version,
+            "corrected_fields": list(self.corrected_fields),
+            "created_at": self.created_at,
+            "confirmed_at": self.confirmed_at,
+            "confirmed_by": self.confirmed_by,
+            "superseded_by": self.superseded_by,
+            "note": self.note,
+            "row_count": len(self.rows),
+            "valid_rows": sum(1 for row in self.rows if row.valid),
+            "missing_row_count": sum(1 for row in self.rows if row.missing_fields),
+            "rows": [row.to_dict() for row in self.rows],
+        }
+
+
+@dataclass
+class CorrectionRecord:
+    """来源更正：一条可追溯的字段修订，挂在一个候选回执版本上。"""
+    correction_id: str
+    batch_id: str
+    version: int
+    field: str
+    old_value: Any
+    new_value: Any
+    value_type: str
+    source_revision: str
+    source_url: str = ""
+    extract_rule_id: str = ""
+    status: str = "待复核"
+    note: str = ""
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "correction_id": self.correction_id,
+            "batch_id": self.batch_id,
+            "version": self.version,
+            "field": self.field,
+            "old_value": self.old_value,
+            "new_value": self.new_value,
+            "value_type": self.value_type,
+            "source_revision": self.source_revision,
+            "source_url": self.source_url,
+            "extract_rule_id": self.extract_rule_id,
+            "status": self.status,
+            "note": self.note,
+            "created_at": self.created_at,
+        }
+
+
+def _legacy_matches(stored: str, computed: str) -> bool:
+    """旧批次摘要只存了 16 位十六进制，按前缀比对；空值视为无法核对。"""
+    if not stored or not computed:
+        return False
+    return computed.startswith(stored) or stored.startswith(computed)
 
 
 @dataclass

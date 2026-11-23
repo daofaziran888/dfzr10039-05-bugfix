@@ -20,11 +20,12 @@ from typing import Any
 from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
-    DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
-    SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
+    DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry, ProxyNode,
+    QualitySample, RawExtractedContent, SampleMethod, SchedulePlan, SiteConfig,
+    SiteType, StorageBatch, UrlFingerprint, is_missing,
 )
 from app.store import store
+from app.receipts import registry
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,17 @@ def run_crawl_pipeline(site_row: dict[str, Any], job_row: dict[str, Any],
     batch.status = "校验通过" if all(c.is_valid() for c in cleaned) else "校验失败"
 
     _persist_batch(batch)
+    registry.register_batch(
+        batch.batch_id,
+        cleaned,
+        source_job_id=batch.source_job_id,
+        storage_path=batch.storage_path,
+        schema_version=batch.schema_version,
+    )
+    registry.create_receipt(
+        batch.batch_id, "pipeline", cleaned,
+        note="采集链路清洗完成后同步到批次存储清单",
+    )
 
     return batch
 
@@ -146,33 +158,50 @@ def _simulate_extract(url: str, rule: ExtractRule) -> RawExtractedContent:
 
 
 def _apply_clean_rules(raw: RawExtractedContent, rules: list[CleanRule]) -> CleanedContent:
-    """对原始抽取内容逐字段应用清洗规则。同字段多条规则链式执行。"""
+    """对原始抽取内容逐字段应用清洗规则。同字段多条规则链式执行。
+
+    字段值按规则目标类型保存（0 是 int、False 是 bool）；原始抽取输入原样
+    保留，真实空项写入 missing_fields，供存储侧逐行核查。
+    """
     cleaned_fields: dict[str, Any] = {}
     errors: list[str] = []
+    field_sources: dict[str, str] = {}
 
     for rule in rules:
         field = rule.target_field
         # 已清洗过的字段从 cleaned_fields 读取，实现链式清洗
-        raw_value = cleaned_fields.get(field, raw.raw_fields.get(field, ""))
+        if field in cleaned_fields:
+            raw_value = cleaned_fields[field]
+        else:
+            raw_value = raw.raw_fields.get(field, "")
+            if field in raw.raw_fields:
+                field_sources[field] = f"raw:{raw.extract_rule_id}"
 
-        if not raw_value and rule.null_strategy == "skip":
+        if is_missing(raw_value):
+            if rule.null_strategy == "fill_default":
+                cleaned_fields[field] = "N/A"
+                field_sources[field] = f"clean:{rule.rule_id}"
+                continue
+            # skip / 其它策略：只有原始输入里明确出现的空项才记为真实缺失；
+            # 输入里完全没有该字段时既不算合法值也不凭空造字段。
+            if field in raw.raw_fields:
+                cleaned_fields.setdefault(field, raw_value)
+                field_sources.setdefault(field, f"raw:{raw.extract_rule_id}")
             continue
-        if not raw_value and rule.null_strategy == "fill_default":
-            raw_value = "N/A"
 
         try:
             if rule.clean_type.value == "去空格":
-                value = raw_value.strip()
+                value = raw_value.strip() if isinstance(raw_value, str) else raw_value
             elif rule.clean_type.value == "标准化":
-                value = raw_value.lower().replace(" ", "_")
+                value = raw_value.lower().replace(" ", "_") if isinstance(raw_value, str) else raw_value
             elif rule.clean_type.value == "校验":
-                if rule.validation_range and not re.match(rule.validation_range, raw_value):
+                text = str(raw_value)
+                if rule.validation_range and not re.match(rule.validation_range, text):
                     errors.append(f"字段 {field} 校验失败: {raw_value}")
-                    value = raw_value
-                else:
-                    value = raw_value
+                value = raw_value
             elif rule.clean_type.value == "正则提取":
-                m = re.search(rule.expression, raw_value) if rule.expression else None
+                text = str(raw_value)
+                m = re.search(rule.expression, text) if rule.expression else None
                 value = m.group(1) if m else raw_value
             elif rule.clean_type.value == "类型转换":
                 value = _cast_type(raw_value, rule.expression)
@@ -183,26 +212,77 @@ def _apply_clean_rules(raw: RawExtractedContent, rules: list[CleanRule]) -> Clea
             value = raw_value
 
         cleaned_fields[field] = value
+        field_sources[field] = f"clean:{rule.rule_id}"
+
+        # 配置了校验范围时，对清洗后的值做格式校验；0/False 是合法值，照常参与
+        if rule.validation_range and not is_missing(value):
+            if not re.match(rule.validation_range, str(value)):
+                errors.append(f"字段 {field} 校验失败: {value}")
+
+    # 清洗规则未覆盖但原始输入存在的字段也要进入清单，保持可追溯
+    for field, value in raw.raw_fields.items():
+        if field not in cleaned_fields:
+            cleaned_fields[field] = value
+            field_sources.setdefault(field, f"raw:{raw.extract_rule_id}")
 
     return CleanedContent(
         source_url=raw.source_url,
         extract_rule_id=raw.extract_rule_id,
         fields=cleaned_fields,
+        raw_fields=dict(raw.raw_fields),
         clean_errors=errors,
+        missing_fields=[name for name, value in cleaned_fields.items() if is_missing(value)],
+        field_sources=field_sources,
     )
 
 
-def _cast_type(value: str, target: str) -> Any:
-    if target == "int":
-        return int(value) if value.isdigit() else value
-    if target == "float":
-        try:
-            return float(value)
-        except ValueError:
+def _cast_type(value: Any, target: str) -> Any:
+    """按目标类型转换字段值，0 / False 等合法值保持各自类型。"""
+    if value is None:
+        return value
+    target = (target or "").strip().lower()
+    if target in ("bool", "boolean", "布尔"):
+        if isinstance(value, bool):
             return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes", "y", "on", "是"):
+            return True
+        if text in ("false", "0", "no", "n", "off", "否", ""):
+            return False
+        raise ValueError(f"无法转换为布尔值: {value!r}")
+    if target in ("int", "integer", "整数"):
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            if value.is_integer():
+                return int(value)
+            raise ValueError(f"无法无损转换为整数: {value!r}")
+        text = str(value).strip()
+        if re.fullmatch(r"[+-]?\d+", text):
+            return int(text)
+        raise ValueError(f"无法转换为整数: {value!r}")
+    if target in ("float", "number", "小数"):
+        if isinstance(value, bool):
+            return float(value)
+        return float(str(value).strip())
     if target == "datetime":
         return value  # 简化实现
     return value
+
+
+def _apply_review_rules(raw_fields: dict[str, Any], rules: list[CleanRule],
+                        *, source_url: str, extract_rule_id: str) -> CleanedContent:
+    """字段清洗页面的复核入口：接受任意原始输入并用规则产出回执。"""
+    raw = RawExtractedContent(
+        source_url=source_url,
+        extract_rule_id=extract_rule_id,
+        raw_fields=dict(raw_fields),
+    )
+    return _apply_clean_rules(raw, rules)
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +572,10 @@ def schedule_job(job: CrawlJobSpec) -> SchedulePlan | None:
 # ---------------------------------------------------------------------------
 
 def recover_failed_batch(batch: StorageBatch) -> StorageBatch | None:
-    """恢复失败的批次：重新对缺失记录执行抽取和清洗。"""
+    """重验失败批次：只对真实空项做补齐，0 / False 等合法值原样保留。
+
+    重验不会擅自改写字段类型或来源，缺失补齐后仍按新回执重新计算摘要。
+    """
     if batch.status != "校验失败":
         return None
 
@@ -501,15 +584,16 @@ def recover_failed_batch(batch: StorageBatch) -> StorageBatch | None:
     if not failed_records:
         return None
 
-    # 重试：对失败记录重新填充缺失字段
     for record in failed_records:
-        for field, value in list(record.fields.items()):
-            if not value or value == "":
-                record.fields[field] = f"recovered:{field}"
-        # 恢复后清除之前清洗错误标记
+        missing = record.missing_fields or record.compute_missing_fields()
+        for field in missing:
+            # 缺失字段留痕：保留原值，记录来源，补一个可识别的占位值
+            record.fields[field] = f"recovered:{field}"
+            record.field_sources[field] = f"recover:{batch.batch_id}"
+        record.missing_fields = []
+        # 清洗错误可能在重验中确认是误报，清除后由新的字段判定决定
         record.clean_errors = []
 
-    # 重新校验
     batch.checksum = batch.compute_checksum()
     batch.status = "校验通过" if all(r.is_valid() for r in batch.records) else "校验失败"
     batch.stored_at = datetime.now(timezone.utc).isoformat()
@@ -561,8 +645,7 @@ def _persist_batch(batch: StorageBatch) -> None:
         "压缩格式": batch.compression,
         "Schema版本": batch.schema_version,
         "校验摘要": batch.checksum[:16],
-        "入库时间": batch.stored_at,
-        "status": batch.status,
+        "入库时间": batch.stored_at,        "status": batch.status,
         "pending": False,
         "abnormal": batch.status == "校验失败",
     })

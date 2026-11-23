@@ -6,6 +6,15 @@
         <p class="page-desc">{{ meta.desc }}</p>
       </div>
       <div class="page-actions">
+        <RouterLink
+          v-for="link in meta.extraLinks ?? []"
+          :key="link.to"
+          class="btn"
+          :to="link.to"
+          :data-testid="`extra-link-${meta.key}`"
+        >
+          {{ link.label }}
+        </RouterLink>
         <button class="btn primary" data-testid="open-create" type="button" @click="openCreate">
           登记{{ meta.entity }}
         </button>
@@ -50,6 +59,14 @@
           <td v-for="column in meta.fields" :key="column">{{ row[column] ?? '—' }}</td>
           <td>{{ row.status }}</td>
           <td class="row-actions">
+            <RouterLink
+              v-if="meta.detailPath"
+              class="link"
+              :to="meta.detailPath(row)"
+              :data-testid="`detail-${row.id}`"
+            >
+              详情
+            </RouterLink>
             <button
               v-for="action in meta.actions"
               :key="action"

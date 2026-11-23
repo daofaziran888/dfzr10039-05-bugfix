@@ -81,5 +81,37 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 字段校验回执与批次版本
+
+清洗与存储之间用「字段校验回执」衔接：
+
+- 值语义：数字 `0`、布尔 `false` 都是**合法值**，按字段类型保存（`int`/`float`/`bool`）；
+  只有 `None`、空字符串、空容器才算**真实空项**（`app/models.py:is_missing`）。
+- 每行回执带字段值、类型、来源（`raw:<抽取规则>` / `clean:<清洗规则>` / `correction:<来源修订>`），
+  真实空项列在 `missing_fields`，原始输入保留在 `raw_fields`，可回查抽取规则。
+- 批次摘要升级为 `manifest-v2/sha256`：把字段类型标签一起纳入，`0`、`"0"`、`false`、
+  空字符串不会互相碰撞；摘要自包含，可脱离批次按清单独立重算。
+- 历史批次仍保留旧算法摘要（`legacy_fields_digest`，16 位前缀），已确认的历史摘要可继续核对。
+
+重验与来源更正会各自生成候选回执；确认动作在锁内做「幂等 / 基于已确认版本 / 唯一有效版本」
+三重校验，同一批次只允许一个可入库版本，未选中的候选与冲突都留在历史里可查。
+只有在有效回执被确认后，批次详情才给出可用于验收的摘要。
+
+### 相关接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/field_clean/review` | 字段清洗页面复核输入，返回逐字段回执 |
+| GET | `/api/field_clean/review/history` | 复核历史 |
+| GET | `/api/batch_store/{批次编号}/detail` | 批次存储详情：清单 + 当前有效回执 + 历史版本/更正 |
+| GET | `/api/batch_store/{批次编号}/receipts` | 回执版本与更正记录 |
+| POST | `/api/batch_store/{批次编号}/revalidate` | 重验，生成候选回执 |
+| POST | `/api/batch_store/{批次编号}/corrections` | 接收来源修订，生成候选回执 |
+| POST | `/api/batch_store/{批次编号}/receipts/{version}/confirm` | 确认唯一可入库版本 |
+| POST | `/api/batch_store/{批次编号}/verify` | 按清单独立校验摘要 |
+
+前端入口：`/field_clean/review`（清洗规则页「输入复核」）、
+`/batch_store/{批次编号}/detail`（批次列表「详情」）。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

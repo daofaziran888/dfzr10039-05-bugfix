@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.models import is_missing
 from app.store import store
 
 
@@ -44,9 +45,10 @@ class BaseModuleService:
         return store.find(self.MODULE, entry_id)
 
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        # 0 / False 是合法值，不能因为 bool 假值被判定成缺失
         missing = [
             field for field in self.REQUIRED_FIELDS
-            if not str(values.get(field) or "").strip()
+            if is_missing(values.get(field))
         ]
         if missing:
             return None, missing

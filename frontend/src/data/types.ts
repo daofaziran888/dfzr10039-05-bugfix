@@ -18,6 +18,8 @@ export type ModuleMeta = {
   actions: string[]
   actionTargets: Record<string, string>
   metrics: string[]
+  detailPath?: (row: EntryRow) => string
+  extraLinks?: { label: string; to: string }[]
 }
 
 export type PageResult = {

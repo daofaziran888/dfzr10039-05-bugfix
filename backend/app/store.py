@@ -47,3 +47,9 @@ class Store:
 
 
 store = Store()
+
+# 历史批次演示数据：旧规则把金额 0 误判为缺失，导致整批校验失败。
+# 放在仓库初始化之后注入，保证回执与批次清单使用同一份记录。
+from app.receipts import seed_store as _seed_receipts  # noqa: E402
+
+_seed_receipts(store)
